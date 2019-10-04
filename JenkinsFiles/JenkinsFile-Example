@@ -1,0 +1,73 @@
+node{
+	#pointing jenkins towards a specific branch, the pipeline must have git data for the project saved before executing this
+    def scmVars = checkout([
+    $class : 'GitSCM',
+               branches : [[name: '*/Development']],
+               doGenerateSubmoduleConfigurations: false,
+               extensions : [[$class: 'CleanBeforeCheckout']],
+               submoduleCfg : [],
+           ])
+	stage('SCM Checkout'){
+	    git url:'https://github.com/qa-concourse/QA-Concourse-Frontend.git'
+	}
+	stage('SCM Check'){
+	    sh 'git checkout Development'
+	    sh 'git pull'
+	}
+	#orders jenkins to run a sonarqube scan, jenkins must have sonarqube scanner plugin installed and configured
+	stage('Sonarqube') {
+ 	    sh '/sonar-scanner-3.3.0.1492-linux/bin/sonar-scanner -Dsonar.host.url=http://52.18.14.235:9000 -Dsonar.projectKey=2 -Dsonar.sources=. -Dsonar.login=7ab57d87a0a3b95ab041077ad51b4ec4b071fd46'   
+    }
+}
+
+def dockerRemove = 'docker rm -f qa-concourse-front'
+def dockerPull = 'docker pull qacdocker/concourse:qa-concourse-front'
+def dockerRunFront = 'docker run --name qa-concourse-front -d -p 3000:3000 qacdocker/concourse:qa-concourse-front'
+def dockerLogin = 'docker login --username $user --password $pass'
+pipeline {
+    agent any
+    stages {
+        stage('Docker Build Image'){
+            steps{
+                sh 'docker-compose build'
+            }
+        }
+		#building image and pushing to dockerhub, requires dockerhub credentials to be saved in jenkins
+        stage('Clean and Push Containers and Images'){
+            steps{
+                withCredentials([usernamePassword(credentialsId: 'dockerhubcred', passwordVariable: 'pass', usernameVariable: 'user')]) {
+                    sh 'docker login --username $user --password $pass'
+                    sh 'docker-compose down'
+                    sh 'docker-compose push'
+                }
+            }
+        }
+		#credentials to access ec2 are saved in jenkins as an id
+        stage('Connect to remote server, remove old container and run new'){
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhubcred', passwordVariable: 'pass', usernameVariable: 'user')]) {
+                    sshagent(['8faa7fbf-d692-49b9-b38f-7ec78f695220']) {
+                        sh "ssh -tt -o StrictHostKeyChecking=no ubuntu@18.203.253.227 ${dockerLogin}"
+                        sh "ssh -tt -o StrictHostKeyChecking=no ubuntu@18.203.253.227 ${dockerRemove}"
+                        sh "ssh -tt -o StrictHostKeyChecking=no ubuntu@18.203.253.227 ${dockerRunFront}"
+                    }
+                }
+            }
+        }
+    }
+	#discord and email notifications
+    post {
+        always {
+            discordSend description: 'QA_Concourse-Front-Dev-Server build from Pipeline',link: 'http://108.128.97.115/job/Concourse-Front-DevServers/', title: 'QA-Concourse-Front-Dev-Deployment', successful: currentBuild.resultIsBetterOrEqualTo('SUCCESS'), webhookURL: 'https://discordapp.com/api/webhooks/$url'
+            emailext attachLog: true,
+            subject: '$DEFAULT_SUBJECT',
+            body: '$DEFAULT_CONTENT',
+            recipientProviders: [
+                [$class: 'DevelopersRecipientProvider'],
+                [$class: 'RequesterRecipientProvider']
+                ],
+                replyTo: '$DEFAULT_REPLYTO',
+                to: '$DEFAULT_RECIPIENTS'
+        }
+    }
+}
